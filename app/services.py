@@ -7,6 +7,7 @@ from typing import Any, Optional
 
 from fastapi import HTTPException, status
 
+from . import audit
 from .evaluation import evaluate
 from .models import READING_VOIDED, VERDICT_LABELS_ZH
 from .report import build_revision_report
@@ -56,6 +57,8 @@ def create_window(conn: sqlite3.Connection, payload: WindowCreate) -> dict[str, 
     row = conn.execute("SELECT * FROM windows WHERE id = ?", (cur.lastrowid,)).fetchone()
     # 初始规则视为第 1 版，随建窗一并留存
     _ensure_initial_rule_revision(conn, row)
+    # 同一写事务内保存序号 0 的审定基线（当时规则 + 活动读数重算）
+    audit.insert_baseline(conn, row, backfilled=False)
     return window_to_dict(conn, row)
 
 

@@ -415,3 +415,58 @@ class RevisionReportOut(BaseModel):
 
 class ErrorBody(BaseModel):
     detail: str
+
+
+# ------------------------------------------------------------ 审定履历
+
+class AuditStateBrief(BaseModel):
+    """一条履历的操作前/后审定状态摘要。"""
+
+    verdict: str = Field(..., description="审定结论 pass | pending | fail")
+    max_continuous_exceeded_seconds: float = Field(
+        ..., description="最长连续超限时长，秒")
+    rule_revision: int = Field(..., description="当时的审定规则版本")
+    reading_count: int = Field(..., description="当时的活动读数条数")
+
+
+class AuditTimelineChange(BaseModel):
+    """履历记录的前后状态不同的半开区段（形状同修订影响报告 timeline.changes 项）。"""
+
+    start: str
+    end: str
+    duration_seconds: float
+    before: dict[str, Any] = Field(..., description="变化前状态与证据（status/evidence）")
+    after: dict[str, Any] = Field(..., description="变化后状态与证据（status/evidence）")
+
+
+class AuditHistoryEntry(BaseModel):
+    """一条审定履历：序号 0 为基线，其后为每次实际生效写操作各一条。"""
+
+    seq: int = Field(..., description="窗口内连续序号：0 为审定基线，此后连续递增")
+    window_id: int
+    operation: str = Field(
+        ..., description="baseline | reading_submit | readings_batch | "
+                         "reading_void | rules_revision")
+    occurred_at: str = Field(..., description="操作实际生效（事务提交）时间，UTC")
+    reading_ids: list[str] = Field(
+        ..., description="涉及的读数 ID（批量按请求顺序；基线为空）")
+    rule_revisions: list[int] = Field(
+        ..., description="涉及的规则版本（规则修订记录目标版本等；其余操作可为空）")
+    detail: dict[str, Any] = Field(
+        ..., description="操作详情（effect、逐项结果、作废修订号/原因、规则修订原因等）")
+    before: Optional[AuditStateBrief] = Field(
+        None, description="操作前审定状态；基线（seq=0）为 null")
+    after: AuditStateBrief = Field(..., description="操作后审定状态")
+    changed_segments: list[AuditTimelineChange] = Field(
+        ..., description="前后状态不同的半开区段（结论不变时也可为空数组）")
+
+
+class AuditHistoryPage(BaseModel):
+    """履历分页响应：按窗口与起始序号升序。"""
+
+    window_id: int
+    start_seq: int = Field(..., description="本次读取的起始序号（含）")
+    limit: int
+    entries: list[AuditHistoryEntry]
+    next_start_seq: Optional[int] = Field(
+        None, description="尚有后续时的下一页起始序号；已到末尾为 null")

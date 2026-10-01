@@ -104,6 +104,31 @@ CREATE TABLE IF NOT EXISTS window_rule_revisions (
 
 CREATE INDEX IF NOT EXISTS idx_window_rule_revisions_window
     ON window_rule_revisions(window_id, revision);
+
+-- 审定履历：窗口创建时写入序号 0 的审定基线（origin=window_created）；
+-- 既有窗口升级时以当时规则与活动读数补建基线（origin=backfilled，
+-- 操作时间取补建时刻，不伪造更早操作）。此后每次实际生效的写操作在同一
+-- 写事务内追加一条窗口内连续编号履历；幂等重放/签发/失败请求不产生履历。
+-- (window_id, seq) 唯一保证序号连续；写事务 BEGIN IMMEDIATE 使并发写入
+-- 按实际提交顺序分配序号。
+CREATE TABLE IF NOT EXISTS window_audit_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    window_id INTEGER NOT NULL REFERENCES windows(id),
+    seq INTEGER NOT NULL,                   -- 窗口内履历序号：0 为基线，此后连续递增
+    operation TEXT NOT NULL,                -- baseline | reading_submit | readings_batch
+                                            -- | reading_void | rules_revision
+    reading_ids_json TEXT NOT NULL DEFAULT '[]',   -- 涉及的读数 ID（按请求顺序去重保留）
+    rule_revisions_json TEXT NOT NULL DEFAULT '[]',-- 涉及的规则版本（如规则修订前后版本）
+    detail_json TEXT NOT NULL DEFAULT '{}',        -- 操作详情（effect/原因/逐项结果等）
+    before_state_json TEXT,                 -- 操作前审定状态（结论/最长连续超限等）；基线为 NULL
+    after_state_json TEXT NOT NULL,         -- 操作后审定状态（结论/最长连续超限等）
+    changed_segments_json TEXT NOT NULL DEFAULT '[]', -- 前后状态不同的半开区段（含证据）
+    occurred_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE(window_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_window_audit_history_window_seq
+    ON window_audit_history(window_id, seq);
 """
 
 # 旧库迁移：CREATE TABLE IF NOT EXISTS 不会给已存在的表补列，
@@ -156,6 +181,11 @@ def init_db(conn: sqlite3.Connection) -> None:
         if column not in cols:
             conn.execute(ddl)
     conn.execute(_BACKFILL_INITIAL_RULE_REVISION_SQL)
+    # 既有窗口（升级前创建、尚无履历）以当时的规则与活动读数补建序号 0 基线，
+    # 不补造更早操作；建窗路径在其写事务内直接写入基线，这里幂等跳过。
+    from .audit import backfill_baselines
+
+    backfill_baselines(conn)
     conn.commit()
 
 

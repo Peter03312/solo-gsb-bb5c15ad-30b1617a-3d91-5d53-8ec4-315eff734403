@@ -243,3 +243,52 @@ d=json.load(sys.stdin)
 print('rules:',json.dumps(d['rules'],ensure_ascii=False))
 print('verdict:',d['summary']['verdict_before'],'->',d['summary']['verdict_after'])
 print('conclusion:',d['summary']['conclusion_zh'])"
+
+echo "== 16. 审定履历（按窗口、按时间追溯；序号 0 为建窗基线，此后连续编号）=="
+echo "-- 16.1 全量读取（升序；每条含操作类型/涉及读数 ID 或规则版本/前后结论与最长连续超限/状态变化区段）--"
+api GET "/api/v1/windows/$WID/audit-history" \
+  | python3 -c "
+import sys,json
+for e in json.load(sys.stdin)['entries']:
+    b=e['before']['verdict'] if e['before'] else '-'
+    print(e['seq'], e['operation'], e['reading_ids'], e['rule_revisions'],
+          b, '->', e['after']['verdict'],
+          'max', e['after']['max_continuous_exceeded_seconds'],
+          'changed', len(e['changed_segments']))"
+
+echo "-- 16.2 从指定序号分页读取（start_seq 含；limit；next_start_seq 给出下一页起点）--"
+api GET "/api/v1/windows/$WID/audit-history?start_seq=1&limit=3" | python3 -m json.tool
+
+echo "-- 16.3 幂等重放与签发证书不产生履历：先记当前条数，再做幂等作废重放 + 签发 --"
+SEQ_BEFORE=$(api GET "/api/v1/windows/$WID/audit-history" \
+  | python3 -c "import sys,json;print(len(json.load(sys.stdin)['entries']))")
+api POST "/api/v1/windows/$WID/rules/revisions" '{
+  "target_revision": 2,
+  "allowed_temp_min": 18.0,
+  "allowed_temp_max": 21.5,
+  "max_continuous_exceed_seconds": 240,
+  "max_sample_interval_seconds": 600,
+  "reason": "季度复核：收紧温度上限与最长连续超限时长"
+}' >/dev/null
+api POST "/api/v1/windows/$WID/certificates/issue" '{"note":"履历演示签发（不留痕）"}' >/dev/null
+SEQ_AFTER=$(api GET "/api/v1/windows/$WID/audit-history" \
+  | python3 -c "import sys,json;print(len(json.load(sys.stdin)['entries']))")
+echo "幂等规则重放 + 签发前后履历条数：$SEQ_BEFORE -> $SEQ_AFTER（应相同；失败请求同理不留痕）"
+
+echo "-- 16.4 窗口不存在 -> 404；非法序号 -> 422 --"
+api GET "/api/v1/windows/99999/audit-history" || true
+api GET "/api/v1/windows/$WID/audit-history?start_seq=-1" || true
+api GET "/api/v1/windows/$WID/audit-history?start_seq=abc" || true
+
+echo "-- 16.5 新窗口基线：建窗即有序号 0（origin=window_created，空读数按当时规则重算 pending）--"
+NW=$(api POST /api/v1/windows '{
+  "name": "展柜G-履历基线",
+  "start_at": "2026-10-01T00:00:00Z",
+  "end_at":   "2026-10-01T01:00:00Z",
+  "allowed_temp_min": 18.0,
+  "allowed_temp_max": 22.0,
+  "max_continuous_exceed_seconds": 300,
+  "max_sample_interval_seconds": 600
+}')
+NID=$(echo "$NW" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+api GET "/api/v1/windows/$NID/audit-history" | python3 -m json.tool

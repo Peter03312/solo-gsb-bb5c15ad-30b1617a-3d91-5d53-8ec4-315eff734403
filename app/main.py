@@ -11,10 +11,11 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from . import services
+from . import audit, services
 from .database import connect, get_conn, init_db, write_transaction
 from .models import VERDICT_LABELS_ZH, Verdict
 from .schemas import (
+    AuditHistoryPage,
     CertificateOut,
     EvaluationOut,
     IssueRequest,
@@ -48,7 +49,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="博物馆展柜温度暴露审定服务",
-    version="1.4.0",
+    version="1.5.0",
     description=(
         "对展柜在给定审定窗口内的温度读数进行暴露审定："
         "输出正常/超限/未知区段与最长连续超限时长，"
@@ -57,6 +58,9 @@ app = FastAPI(
         "证书版本化签发，"
         "并可对同一窗口两张已签发证书的不可变快照生成修订影响报告"
         "（含跨规则版本的规则前后值对照）。"
+        "每个窗口另有按时间追溯的审定履历：创建时保存序号 0 基线，"
+        "每次实际生效的写操作在同一事务内追加连续编号履历，"
+        "可经 GET /api/v1/windows/{id}/audit-history 按窗口与起始序号读取。"
     ),
     lifespan=lifespan,
 )
@@ -165,9 +169,30 @@ def revise_window_rules(
     """
     # 单个写事务：校验 + 规则落库 + 基于同一状态立即重算
     with write_transaction(conn):
+        win_before = services.get_window_row(conn, window_id)
+        before = audit.capture_state(conn, win_before)
         effect, record = services.revise_window_rules(conn, window_id, payload)
         win = services.get_window_row(conn, window_id)  # 重取更新后的当前规则
         evaluation = services.compute_evaluation(conn, win)
+        after = audit.capture_state(conn, win)
+        if effect != "idempotent":
+            # 规则修订实际生效才追加履历（同号同内容幂等重放不留痕）
+            audit.append_entry(
+                conn,
+                window_id=window_id,
+                operation=audit.OP_RULES_REVISION,
+                detail={
+                    "effect": effect,
+                    "target_revision": record["revision"],
+                    "previous_revision": int(win_before["rule_revision"]),
+                    "rules": record["rules"],
+                    "previous_rules": record["previous_rules"],
+                    "reason": record["reason"],
+                },
+                before=before,
+                after=after,
+                rule_revisions=[record["revision"]],
+            )
         return {"effect": effect, "rule_revision": record,
                 "current_evaluation": evaluation}
 
@@ -210,8 +235,22 @@ def submit_reading(
     # 单个写事务：校验 + 替换/插入 + 基于同一状态立即重算
     with write_transaction(conn):
         win = services.get_window_row(conn, window_id)
+        before = audit.capture_state(conn, win)
         effect, reading = services.submit_reading(conn, window_id, payload)
         evaluation = services.compute_evaluation(conn, win)
+        after = audit.capture_state(conn, win)
+        if effect != "idempotent":
+            # created / updated / restored 都是实际生效操作，各追加一条履历；
+            # 幂等重放不产生履历与序号
+            audit.append_entry(
+                conn,
+                window_id=window_id,
+                operation=audit.OP_READING_SUBMIT,
+                detail={"effect": effect, "reading": reading},
+                before=before,
+                after=after,
+                reading_ids=[reading["reading_id"]],
+            )
         return {"effect": effect, "reading": reading, "current_evaluation": evaluation}
 
 
@@ -239,13 +278,25 @@ def submit_reading_batch(
     # 单个写事务：整批校验 + 整批落库 + 基于最终状态一次重算
     with write_transaction(conn):
         win = services.get_window_row(conn, window_id)
+        before = audit.capture_state(conn, win)
         results = services.submit_reading_batch(conn, window_id, payload)
         evaluation = services.compute_evaluation(conn, win)
-        return {
-            "results": [{"effect": effect, "reading": reading}
-                        for effect, reading in results],
-            "current_evaluation": evaluation,
-        }
+        after = audit.capture_state(conn, win)
+        item_results = [{"effect": effect, "reading": reading}
+                        for effect, reading in results]
+        # 整批只记一条履历：仅当批次中存在实际生效项时追加；全部幂等（同批重放）
+        # 不产生履历与序号。涉及读数按请求顺序保留，逐项 effect/最终读数入详情。
+        if any(effect != "idempotent" for effect, _ in results):
+            audit.append_entry(
+                conn,
+                window_id=window_id,
+                operation=audit.OP_READINGS_BATCH,
+                detail={"results": item_results},
+                before=before,
+                after=after,
+                reading_ids=[reading["reading_id"] for _, reading in results],
+            )
+        return {"results": item_results, "current_evaluation": evaluation}
 
 
 @app.post(
@@ -272,8 +323,26 @@ def void_reading(
     # 单个写事务：校验 + 作废落库 + 基于同一状态立即重算
     with write_transaction(conn):
         win = services.get_window_row(conn, window_id)
+        before = audit.capture_state(conn, win)
         effect, record = services.void_reading(conn, window_id, reading_id, payload)
         evaluation = services.compute_evaluation(conn, win)
+        after = audit.capture_state(conn, win)
+        if effect != "idempotent":
+            # 作废实际生效才追加履历（相同修订号+原因的幂等重放不留痕）
+            audit.append_entry(
+                conn,
+                window_id=window_id,
+                operation=audit.OP_READING_VOID,
+                detail={
+                    "effect": effect,
+                    "revision": record["revision"],
+                    "reason": record["reason"],
+                    "previous": record["previous"],
+                },
+                before=before,
+                after=after,
+                reading_ids=[reading_id],
+            )
         return {"effect": effect, "void": record, "current_evaluation": evaluation}
 
 
@@ -290,6 +359,40 @@ def list_reading_revisions(
     """该读数 ID 的全部修订历史（含作废记录），按修订号升序。"""
     services.get_window_row(conn, window_id)
     return services.list_reading_revisions(conn, window_id, reading_id)
+
+
+# ---------------------------------------------------------------- 审定履历
+
+@app.get(
+    "/api/v1/windows/{window_id}/audit-history",
+    response_model=AuditHistoryPage,
+    tags=["audit-history"],
+)
+def list_audit_history(
+    window_id: int,
+    start_seq: int = Query(
+        0, ge=0, description="起始序号（含），从 0（审定基线）开始；非法序号返回 422"),
+    limit: int = Query(100, ge=1, le=500, description="本页最多返回条数"),
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """按窗口与起始序号顺序读取审定履历（序号 0 为创建时基线，其后连续编号）。
+
+    - 每次实际生效的单条/批量读数提交、作废/恢复、规则修订各一条履历
+      （批量只记一条），记录操作类型、涉及读数 ID 或规则版本、操作前后结论
+      与最长连续超限时长，以及前后状态不同的半开区段；结论不变也记录；
+    - 幂等重放、签发证书、失败请求不产生履历与序号；
+    - 窗口不存在 -> 404；起始序号非法（非整数/负数）-> 422；
+    - 尚有后续时响应给出下一页起始序号 next_start_seq。
+    """
+    services.get_window_row(conn, window_id)  # 窗口不存在 -> 404
+    entries, next_start_seq = audit.list_entries(conn, window_id, start_seq, limit)
+    return {
+        "window_id": window_id,
+        "start_seq": start_seq,
+        "limit": limit,
+        "entries": entries,
+        "next_start_seq": next_start_seq,
+    }
 
 
 # ---------------------------------------------------------------- 签发

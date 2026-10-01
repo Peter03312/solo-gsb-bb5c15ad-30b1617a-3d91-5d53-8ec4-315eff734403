@@ -17,7 +17,9 @@
   7) 窗口审定规则修订：目标规则修订号+四项完整新值+非空原因，初始规则为
      第 1 版、目标号=当前版+1 生效、同号同内容重放幂等、同号冲突/旧号/跳号
      拒绝；修订后立即重算，后续签发采用新规则；跨规则版本的修订影响报告
-     展示四项规则前后值与变化（结论未变也可看出规则变更）。
+     展示四项规则前后值与变化（结论未变也可看出规则变更）；
+  8) 审定履历：建窗即有序号 0 基线，生效写操作在同一事务连续编号留痕，
+     幂等重放/签发/失败请求不产生履历；按窗口与起始序号分页 HTTP 查询。
 """
 from __future__ import annotations
 
@@ -423,6 +425,69 @@ def main() -> None:
     assert s["verdict_changed"] is False and s["rules_changed"] is True
     assert (s["rule_revision_before"], s["rule_revision_after"]) == (1, 2)
     print("汇总结论:", s["conclusion_zh"])
+
+    # ---------- 审定履历（按窗口、按时间追溯） ----------
+    show("审定履历：序号 0 基线 + 生效操作连续编号；幂等/签发/失败不留痕")
+    # 以窗口 wf（展柜F）为例：建窗 + 6 条读数 + 1 次规则修订
+    def get_history(wid, start_seq=0, limit=100):
+        return call("GET", f"/api/v1/windows/{wid}/audit-history"
+                           f"?start_seq={start_seq}&limit={limit}")[1]
+
+    page = get_history(wf)
+    assert page["next_start_seq"] is None
+    entries = page["entries"]
+    print(f"履历条数：{len(entries)}（基线 1 + 读数 6 + 规则修订 1 = 8）")
+    assert entries[0]["seq"] == 0 and entries[0]["operation"] == "baseline"
+    assert entries[0]["before"] is None
+    assert entries[0]["detail"] == {"origin": "window_created"}
+    assert entries[0]["after"] == {
+        "verdict": "pending", "max_continuous_exceeded_seconds": 0.0,
+        "rule_revision": 1, "reading_count": 0}
+    assert [e["seq"] for e in entries] == list(range(len(entries)))  # 序号连续
+    for e in entries:
+        b = e["before"]["verdict"] if e["before"] else "-"
+        print(f"  #{e['seq']:>2} {e['operation']:<16} "
+              f"读数={e['reading_ids']} 规则版本={e['rule_revisions']} "
+              f"{b} -> {e['after']['verdict']} "
+              f"最长超限={e['after']['max_continuous_exceeded_seconds']:g}s "
+              f"状态变化区段={len(e['changed_segments'])}")
+    rule_entry = next(e for e in entries if e["operation"] == "rules_revision")
+    assert rule_entry["rule_revisions"] == [2]
+    assert rule_entry["before"]["rule_revision"] == 1
+    assert rule_entry["after"]["rule_revision"] == 2
+    assert rule_entry["detail"]["reason"] == "季度复核：收紧温度上限与最长连续超限时长"
+
+    # 结论不变也记录：展柜F 每次读数提交后一直 pending（最后一次才 pass? 否，
+    # 满覆盖读数首次即 pass——这里用窗口 w1 演示 pending->pending 也留痕）
+    w1_entries = get_history(w1)["entries"]
+    assert all(e["operation"] != "baseline" or e["seq"] == 0 for e in w1_entries)
+    assert len(w1_entries) == 5  # 基线 + 4 条读数
+
+    # 幂等重放 / 签发 / 失败请求不产生履历与序号
+    n_before = len(get_history(wf)["entries"])
+    assert revise_rules(wf, 2, tmax=21.5, max_exceed=240,
+                        reason="季度复核：收紧温度上限与最长连续超限时长")[1]["effect"] \
+        == "idempotent"
+    call("POST", f"/api/v1/windows/{wf}/certificates/issue", {"note": "履历演示签发"})
+    assert call("POST", f"/api/v1/windows/{wf}/readings",
+                {"reading_id": "bad", "revision": 1,
+                 "measured_at": "2026-10-02T00:00:00Z", "temperature": 20.0})[0] == 422
+    assert len(get_history(wf)["entries"]) == n_before
+    print("幂等重放、签发、失败请求后履历条数不变：", n_before)
+
+    # 分页：start_seq 含、limit、next_start_seq
+    p1 = get_history(wf, start_seq=0, limit=3)
+    assert [e["seq"] for e in p1["entries"]] == [0, 1, 2]
+    assert p1["next_start_seq"] == 3
+    p2 = get_history(wf, start_seq=3, limit=3)
+    assert [e["seq"] for e in p2["entries"]] == [3, 4, 5]
+    print("分页：", p1["next_start_seq"], "-> 第二页序号",
+          [e["seq"] for e in p2["entries"]], "next:", p2["next_start_seq"])
+
+    # 窗口不存在 404；非法序号 422
+    assert call("GET", "/api/v1/windows/99999/audit-history")[0] == 404
+    assert call("GET", f"/api/v1/windows/{wf}/audit-history?start_seq=-1")[0] == 422
+    print("窗口不存在 404、非法序号 422 均符合约定")
 
     print("\n全部示例执行完成 ✔")
 

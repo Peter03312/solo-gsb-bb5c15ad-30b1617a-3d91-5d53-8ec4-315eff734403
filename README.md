@@ -10,7 +10,9 @@
 证书版本化签发（快照不可变），并可对同一审定窗口的两张已签发证书生成
 **修订影响报告**（只读快照比对：四项审定规则前后值与变化、读数新增/变更/移除、
 时间线状态变化半开区间、结论与最长连续超限时长变化；时间线分别依据两张
-证书快照各自的规则与读数重建）。
+证书快照各自的规则与读数重建），并为每个窗口保存**按时间追溯的审定履历**
+（创建时序号 0 基线；单条/批量读数提交、作废或恢复、规则修订每次生效后在
+同一写事务内连续编号留痕；幂等重放、签发与失败请求不产生履历）。
 
 - 技术栈：Python 3.11 · FastAPI · SQLite（WAL 模式）· Pydantic v2
 - 无外部服务依赖，`docker compose up -d` 一键启动并自动初始化数据库
@@ -149,6 +151,33 @@
   签发（读）与修订（写）并发时，以事务为边界取同一已提交状态——
   修订先提交则纳入本次签发，否则等签发完成后再生效，不会出现脏读或快照撕裂。
 
+### 审定履历（按时间追溯）
+
+每个窗口保存一份**窗口内连续编号**的审定履历，供馆员按时间追溯审定的变化：
+
+- **序号 0 基线**：窗口创建时，在同一写事务内以当时的初始规则与活动读数
+  （建窗时为空）重算审定状态并保存（`detail.origin=window_created`）。
+  **既有窗口升级**时，启动建表迁移会以窗口**当时的规则与活动读数**补建一条
+  序号 0 基线（`detail.origin=backfilled`，操作时间取补建时刻），不补造任何
+  更早的操作；已存在基线的窗口（含再次启动）幂等跳过。
+- **生效即留痕**：单条读数提交（`created`/`updated`/`restored`）、误采作废
+  （`voided`；恢复走单条/批量提交入口）、规则修订（`revised`）每次**实际
+  生效后**，在**同一写事务**内追加一条履历，序号在窗口内连续递增；
+  **批量补传整批只记一条**（逐项 effect 与最终读数入详情）。
+- 每条履历记录：操作类型（`baseline` / `reading_submit` / `readings_batch`
+  / `reading_void` / `rules_revision`）、涉及的**读数 ID** 或**规则版本**、
+  操作**前后结论与最长连续超限时长**（附当时规则版本与活动读数条数），以及
+  **前后状态不同的半开区段**（按前后时间线全部边界对齐，仅保留 `status`
+  发生变化的 `[start, end)`，含变化前后状态与证据，规则同修订影响报告
+  时间线；相邻同态区间合并）。**即使结论不变**，有效操作也记录。
+- **不产生履历与序号**：幂等重放（读数/作废/规则修订内容一致重放、整批
+  重放全部幂等）、**签发证书**、以及失败请求（409/422/404，事务回滚）。
+- **并发**：写事务以 `BEGIN IMMEDIATE` 串行化，序号按事务**实际提交顺序**
+  分配，连续无缺号；序号读取自同一写事务，随后续提交递增。
+- **读取**：`GET /api/v1/windows/{id}/audit-history?start_seq=&limit=`
+  按窗口与起始序号（含）升序返回，响应给出下一页起始序号 `next_start_seq`；
+  窗口不存在 → **404**，起始序号非法（非整数/负数）或 `limit` 越界 → **422**。
+
 ---
 
 ## 2. 启动
@@ -212,6 +241,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/api/v1/windows/{id}/evaluation` | 只看当前审定结果 |
 | `POST` | `/api/v1/windows/{id}/rules/revisions` | 修订审定规则：目标规则修订号 + 四项完整新值 + 非空原因；目标号为当前版加 1 生效，同号同内容重放幂等，响应含立即重算结果 |
 | `GET` | `/api/v1/windows/{id}/rules/revisions` | 全部规则修订历史（含初始第 1 版；每版留存前后规则、原因与时间），按规则版本升序 |
+| `GET` | `/api/v1/windows/{id}/audit-history?start_seq=&limit=` | 审定履历：按窗口与起始序号升序（序号 0 为建窗基线）；窗口不存在 404，非法序号 422 |
 
 创建窗口请求体：
 
@@ -247,6 +277,88 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   },
   "current_evaluation": { "verdict": "pass", "...": "..." }
 }
+```
+
+### 审定履历
+
+`GET /api/v1/windows/{id}/audit-history`（查询参数 `start_seq` 默认 0、含；
+`limit` 默认 100、1~500）按窗口与起始序号升序返回履历。每条履历含窗口内
+连续 `seq`（0 为基线）、`operation`、`occurred_at`（实际生效时间 UTC）、
+涉及的 `reading_ids` / `rule_revisions`、操作 `detail`、前后状态摘要
+`before` / `after`（结论、最长连续超限时长、规则版本、活动读数条数；基线的
+`before` 为 `null`），以及前后状态不同的半开区段 `changed_segments`
+（结构同修订影响报告的 `timeline.changes` 项）。尚有后续时响应给出
+`next_start_seq`（末条序号 + 1），已到末尾为 `null`。
+
+```json
+{
+  "window_id": 1,
+  "start_seq": 0,
+  "limit": 100,
+  "entries": [
+    {
+      "seq": 0,
+      "window_id": 1,
+      "operation": "baseline",
+      "occurred_at": "2026-10-01T00:00:00.123Z",
+      "reading_ids": [],
+      "rule_revisions": [],
+      "detail": {"origin": "window_created"},
+      "before": null,
+      "after": {"verdict": "pending", "max_continuous_exceeded_seconds": 0.0,
+                "rule_revision": 1, "reading_count": 0},
+      "changed_segments": []
+    },
+    {
+      "seq": 1,
+      "operation": "reading_submit",
+      "occurred_at": "2026-10-01T00:10:00.456Z",
+      "reading_ids": ["b"],
+      "rule_revisions": [],
+      "detail": {"effect": "created", "reading": {"reading_id": "b", "...": "..."}},
+      "before": {"verdict": "pending", "max_continuous_exceeded_seconds": 0.0,
+                 "rule_revision": 1, "reading_count": 1},
+      "after": {"verdict": "fail", "max_continuous_exceeded_seconds": 600.0,
+                "rule_revision": 1, "reading_count": 2},
+      "changed_segments": [
+        {"start": "2026-10-01T00:00:00Z", "end": "2026-10-01T00:10:00Z",
+         "duration_seconds": 600.0,
+         "before": {"status": "unknown",
+                    "evidence": {"unknown_reason": "boundary_gap",
+                                 "boundary_side": "trailing",
+                                 "left_reading_id": "a", "left_revision": 1}},
+         "after": {"status": "exceeded",
+                   "evidence": {"reading_id": "a", "revision": 1}}}
+      ]
+    }
+  ],
+  "next_start_seq": null
+}
+```
+
+各类操作的 `operation` / `detail` 要点：
+
+| 场景 | `operation` | `detail` 要点 | `reading_ids` / `rule_revisions` |
+|---|---|---|---|
+| 建窗基线 / 升级补建 | `baseline` | `origin=window_created` / `backfilled`，`before=null` | 均为空 |
+| 单条提交生效 | `reading_submit` | `effect=created/updated/restored` + 最终读数 | 该读数 ID |
+| 批量补传生效 | `readings_batch` | `results`：逐项 `effect` 与最终读数（整批一条） | 批内读数 ID（请求顺序） |
+| 误采作废生效 | `reading_void` | 作废修订号、原因、前一版本 `previous` | 被作废读数 ID |
+| 规则修订生效 | `rules_revision` | 目标/前一规则版本、前后四项规则值、原因 | 目标规则版本 |
+
+> 幂等重放、签发证书、失败（409/422/404 回滚）请求不产生履历；批量仅当
+> 至少一项实际生效时记一条（全部幂等的同批重放不留痕）。结论不变的有效
+> 操作同样留痕（`changed_segments` 可能为空数组）。
+
+最小调用示例：
+
+```bash
+# 全量读取（默认 start_seq=0&limit=100）
+curl -sS "http://localhost:8000/api/v1/windows/1/audit-history"
+
+# 从序号 5 开始每页 20 条；响应 next_start_seq 为下一页起点（null 表示到末尾）
+curl -sS "http://localhost:8000/api/v1/windows/1/audit-history?start_seq=5&limit=20"
+# 窗口不存在 -> 404；start_seq 为负数/非整数、limit 越界 -> 422
 ```
 
 ### 读数
@@ -435,7 +547,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ### 错误约定
 
 - `404`：窗口/证书不存在（修订影响报告中任一证书缺失）；
-  作废或查询修订历史时读数从未存在；规则修订时窗口不存在
+  作废或查询修订历史时读数从未存在；规则修订时窗口不存在；
+  查询审定履历的窗口不存在
 - `409`：同 ID+修订号内容冲突；旧修订号覆盖（单条与批量语义一致）；
   作废修订号原因冲突或不高于当前修订号；已作废读数再次以新修订号作废；
   以不高于作废修订号的提交尝试复活读数；
@@ -444,7 +557,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   批量请求为空批次/同批 `reading_id` 重复、缺时区/字段非法、
   作废原因为空或只含空白、规则修订数值非有限/温度下限大于上限/
   时长非正/原因为空等；
-  修订影响报告的两证书相同、跨审定窗口、版本未按先后排列也返回 422
+  修订影响报告的两证书相同、跨审定窗口、版本未按先后排列也返回 422；
+  审定履历 `start_seq` 为负数/非整数、`limit` 越界也返回 422
 
 > 批量补传中任一项命中 409/422，整批回滚，错误 `detail` 指出具体原因；
 > 不会出现“批内前几项已生效、后几项失败”的部分写入。
@@ -456,10 +570,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 服务启动后：
 
 ```bash
-# curl 全流程（创建窗口 → 提交/幂等/冲突/修订 → 审定 → 两次签发 → 修订影响报告 → 批量补传 → 误采作废与恢复 → 规则修订）
+# curl 全流程（创建窗口 → 提交/幂等/冲突/修订 → 审定 → 两次签发 → 修订影响报告 → 批量补传 → 误采作废与恢复 → 规则修订 → 审定履历查询）
 bash examples/curl-examples.sh
 
-# Python 全流程（仅标准库，演示三种结论、拒收、修订、版本快照、修订影响报告、批量补传、误采作废与恢复、规则修订）
+# Python 全流程（仅标准库，演示三种结论、拒收、修订、版本快照、修订影响报告、批量补传、误采作废与恢复、规则修订、审定履历）
 python3 examples/python_client.py
 # 或指定地址：
 BASE_URL=http://127.0.0.1:8000 python3 examples/python_client.py
@@ -578,15 +692,21 @@ PYTHONPATH=. python -m pytest tests/ -q
   报告分别按两证快照计算时间线并展示四项规则前后值与变化）。
 - `tests/test_report_api.py`：修订影响报告 HTTP 测试（fail→pass、
   边界空白 vs 采样间隔超限、只依快照、跨窗口/倒序/同 ID/不存在拒绝）。
+- `tests/test_audit_api.py`：审定履历 HTTP 集成测试（建窗序号 0 基线、
+  单条 created/updated/restored、作废、批量只记一条（含部分幂等/全幂等/
+  整批回滚）、规则修订（含收紧间隔的状态变化区段）、结论不变也留痕、
+  幂等重放/签发/失败请求不留痕、按起始序号读取与分页、窗口不存在 404、
+  非法序号 422、既有窗口升级补建基线不伪造更早操作、并发写入序号连续）。
 
 ## 6. 目录结构
 
 ```
 app/
   config.py        # 环境变量配置
-  database.py      # SQLite 连接、WAL、建表（含旧库补列迁移与初始规则补记）、写事务（BEGIN IMMEDIATE）
+  database.py      # SQLite 连接、WAL、建表（含旧库补列迁移与初始规则/履历基线补建）、写事务（BEGIN IMMEDIATE）
   evaluation.py    # 核心审定算法（纯函数）
   report.py        # 修订影响报告（规则前后对照、快照比对、时间线对齐，纯函数）
+  audit.py         # 审定履历（序号 0 基线、生效操作同事务连续留痕、按窗口/序号读取；复用时间线对齐）
   models.py        # 结论枚举/常量
   schemas.py       # Pydantic 请求/响应模型
   services.py      # 窗口、读数（含误采作废/恢复）、规则修订、审定、签发、修订影响报告业务逻辑
