@@ -18,6 +18,9 @@
      第 1 版、目标号=当前版+1 生效、同号同内容重放幂等、同号冲突/旧号/跳号
      拒绝；修订后立即重算，后续签发采用新规则；跨规则版本的修订影响报告
      展示四项规则前后值与变化（结论未变也可看出规则变更）。
+  8) 审定履历：窗口创建保存序号 0 基线，每次实际生效的写操作连续追加一条
+     （前后结论、最长连续超限时长、状态变化半开区段）；幂等重放/签发/失败
+     不占号、批量只占一条；按窗口与起始序号顺序读取，404/422 约定。
 """
 from __future__ import annotations
 
@@ -423,6 +426,34 @@ def main() -> None:
     assert s["verdict_changed"] is False and s["rules_changed"] is True
     assert (s["rule_revision_before"], s["rule_revision_after"]) == (1, 2)
     print("汇总结论:", s["conclusion_zh"])
+
+    # ------------------------------------------------------------ 审定履历
+    show("审定履历：从序号 0 基线起按时间顺序追溯（窗口3 上演示）")
+    # seq=0 为建窗基线；其后仅“实际生效”的写操作占号：
+    # 幂等重放、签发证书、失败请求不产生序号，批量提交只占一条。
+    audit = call("GET", "/api/v1/windows/3/audit-entries")[1]
+    assert audit[0]["seq"] == 0 and audit[0]["operation_type"] == "baseline"
+    print(f"共 {len(audit)} 条履历；基线: verdict={audit[0]['verdict_after']}, "
+          f"source={audit[0]['source']}")
+    for e in audit:
+        print(f"  seq={e['seq']:<2} {e['operation_type_zh']:<6} "
+              f"{str(e['verdict_before']):>7} -> {e['verdict_after']:<7} "
+              f"最长超限 {e['max_continuous_exceeded_seconds_before']} -> "
+              f"{e['max_continuous_exceeded_seconds_after']}s, "
+              f"变化区段 {len(e['changed_segments'])} 个")
+    assert [e["seq"] for e in audit] == list(range(len(audit)))  # 连续无空洞
+
+    # 从指定序号续读 + 分页
+    page = call("GET", "/api/v1/windows/3/audit-entries?from_seq=1&limit=2")[1]
+    print("from_seq=1&limit=2 ->", [e["seq"] for e in page])
+    assert [e["seq"] for e in page][0] == 1 and len(page) <= 2
+
+    # 窗口不存在 404；非法序号/分页 422；超过末尾返回空列表
+    assert call("GET", "/api/v1/windows/99999/audit-entries")[0] == 404
+    assert call("GET", "/api/v1/windows/3/audit-entries?from_seq=-1")[0] == 422
+    assert call("GET", "/api/v1/windows/3/audit-entries?limit=0")[0] == 422
+    assert call("GET", "/api/v1/windows/3/audit-entries?from_seq=999999")[1] == []
+    print("读取约定：窗口不存在 404，from_seq 为负/limit 越界 422，超出末尾返回 []")
 
     print("\n全部示例执行完成 ✔")
 

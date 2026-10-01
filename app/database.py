@@ -104,6 +104,34 @@ CREATE TABLE IF NOT EXISTS window_rule_revisions (
 
 CREATE INDEX IF NOT EXISTS idx_window_rule_revisions_window
     ON window_rule_revisions(window_id, revision);
+
+-- 审定履历（审计日志）：窗口创建即保存序号 0 的审定基线；此后每次实际生效的
+-- 写操作（单条/批量读数提交、作废/恢复、规则修订）在同一写事务内追加一条
+-- 连续编号记录。幂等重放、签发证书、失败请求不产生行；BEGIN IMMEDIATE 串行化
+-- 使 (window_id, seq) 按实际提交顺序连续分配。
+CREATE TABLE IF NOT EXISTS window_audit_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    window_id INTEGER NOT NULL REFERENCES windows(id),
+    seq INTEGER NOT NULL,                     -- 窗口内连续编号：0=基线，其后每次生效操作 +1
+    operation_type TEXT NOT NULL,             -- baseline | reading_submit | reading_restore
+                                              -- | readings_batch | reading_void | rule_revision
+    reading_id TEXT,                          -- 涉及的读数 ID（批量可为 NULL，详情见 operation_json）
+    reading_revision INTEGER,                 -- 涉及的读数修订号（规则修订/批量可为 NULL）
+    rule_revision INTEGER NOT NULL,           -- 记录时的当前规则版本（初始规则为第 1 版）
+    rule_revision_ref INTEGER,                -- 规则修订目标版本（仅 rule_revision）
+    verdict_before TEXT,                      -- 操作前结论（基线为 NULL）
+    verdict_after TEXT NOT NULL,              -- 操作后结论
+    max_exceeded_before REAL,                 -- 操作前最长连续超限时长（基线为 NULL）
+    max_exceeded_after REAL NOT NULL,         -- 操作后最长连续超限时长
+    changed_segments_json TEXT NOT NULL,      -- 前后状态不同的半开区段（基线为 []）
+    operation_json TEXT NOT NULL,             -- 操作详情（涉及读数/规则版本、effect、作废原因等）
+    source TEXT NOT NULL DEFAULT 'created',   -- 基线来源：created=建窗保存 | backfilled=既有窗口补建
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE(window_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_window_audit_entries_window
+    ON window_audit_entries(window_id, seq);
 """
 
 # 旧库迁移：CREATE TABLE IF NOT EXISTS 不会给已存在的表补列，

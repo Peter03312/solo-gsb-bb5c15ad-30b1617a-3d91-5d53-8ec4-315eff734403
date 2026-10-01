@@ -12,9 +12,17 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import services
+from .audit import (
+    OP_READING_RESTORE,
+    OP_READING_SUBMIT,
+    OP_READING_VOID,
+    OP_READINGS_BATCH,
+    OP_RULE_REVISION,
+)
 from .database import connect, get_conn, init_db, write_transaction
 from .models import VERDICT_LABELS_ZH, Verdict
 from .schemas import (
+    AuditEntryOut,
     CertificateOut,
     EvaluationOut,
     IssueRequest,
@@ -41,6 +49,9 @@ async def lifespan(app: FastAPI):
     conn = connect()
     try:
         init_db(conn)
+        # 既有窗口补建序号 0 的审定基线（以当时规则与活动读数，不伪造更早操作）
+        services.backfill_audit_baselines(conn)
+        conn.commit()
     finally:
         conn.close()
     yield
@@ -48,7 +59,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="博物馆展柜温度暴露审定服务",
-    version="1.4.0",
+    version="1.5.0",
     description=(
         "对展柜在给定审定窗口内的温度读数进行暴露审定："
         "输出正常/超限/未知区段与最长连续超限时长，"
@@ -57,6 +68,10 @@ app = FastAPI(
         "证书版本化签发，"
         "并可对同一窗口两张已签发证书的不可变快照生成修订影响报告"
         "（含跨规则版本的规则前后值对照）。"
+        "窗口创建即保存序号 0 的审定基线，此后每次实际生效的写操作"
+        "（单条/批量读数提交、作废/恢复、规则修订）在同一写事务内追加"
+        "连续编号的审定履历（前后结论、最长连续超限时长与状态变化半开区段），"
+        "可按窗口与起始序号顺序读取（/audit-entries）。"
     ),
     lifespan=lifespan,
 )
@@ -165,9 +180,31 @@ def revise_window_rules(
     """
     # 单个写事务：校验 + 规则落库 + 基于同一状态立即重算
     with write_transaction(conn):
+        win_before = services.get_window_row(conn, window_id)
+        services.ensure_audit_baseline(conn, win_before)
+        before_evaluation = services.compute_evaluation(conn, win_before)
         effect, record = services.revise_window_rules(conn, window_id, payload)
         win = services.get_window_row(conn, window_id)  # 重取更新后的当前规则
         evaluation = services.compute_evaluation(conn, win)
+        # 修订实际生效才追加履历；同号同内容的幂等重放不追加。
+        if effect == "revised":
+            services.append_audit_entry(
+                conn,
+                window_id=window_id,
+                operation_type=OP_RULE_REVISION,
+                before_evaluation=before_evaluation,
+                after_evaluation=evaluation,
+                rule_revision=record["revision"],
+                rule_revision_ref=record["revision"],
+                operation={
+                    "effect": "revised",
+                    "rule_revision": record["revision"],
+                    "previous_rule_revision": record["revision"] - 1,
+                    "rules": record["rules"],
+                    "previous_rules": record["previous_rules"],
+                    "reason": record["reason"],
+                },
+            )
         return {"effect": effect, "rule_revision": record,
                 "current_evaluation": evaluation}
 
@@ -183,6 +220,35 @@ def list_window_rule_revisions(
     """该窗口的全部规则修订历史（含初始第 1 版），按规则版本升序。"""
     services.get_window_row(conn, window_id)
     return services.list_window_rule_revisions(conn, window_id)
+
+
+# ---------------------------------------------------------------- 审定履历（审计日志）
+
+@app.get(
+    "/api/v1/windows/{window_id}/audit-entries",
+    response_model=list[AuditEntryOut],
+    tags=["audit"],
+)
+def list_audit_entries(
+    window_id: int,
+    from_seq: int = Query(
+        0, ge=0,
+        description="起始序号（含）；默认 0，即从序号 0 的审定基线开始顺序读取"),
+    limit: int = Query(100, ge=1, le=1000, description="本页最多返回条数（1~1000）"),
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> list[dict[str, Any]]:
+    """按窗口和起始序号顺序（seq 升序）读取审定履历。
+
+    - 序号 0 为窗口创建时（或既有窗口升级时补建）的审定基线；
+    - 其后每次实际生效的写操作（单条/批量读数提交、作废/恢复、规则修订）
+      在同一写事务内追加一条连续编号履历，幂等重放、签发证书与失败请求不占号；
+    - 每条给出操作类型、涉及的读数 ID 或规则版本、操作前后结论与最长连续
+      超限时长，以及前后状态不同的半开区段；
+    - 窗口不存在 -> 404；from_seq 为负等非法序号 -> 422（参数错误）；
+      from_seq 超过当前最大序号时返回空列表（不报错）。
+    """
+    services.get_window_row(conn, window_id)
+    return services.list_audit_entries(conn, window_id, from_seq=from_seq, limit=limit)
 
 
 # ---------------------------------------------------------------- 读数
@@ -207,11 +273,36 @@ def submit_reading(
     payload: ReadingSubmit,
     conn: sqlite3.Connection = Depends(get_conn),
 ) -> dict[str, Any]:
-    # 单个写事务：校验 + 替换/插入 + 基于同一状态立即重算
+    # 单个写事务：校验 + 替换/插入 + 基于同一状态立即重算；
+    # 实际生效（created/updated/restored）时在同一事务内追加一条履历，
+    # 幂等重放不产生履历。
     with write_transaction(conn):
         win = services.get_window_row(conn, window_id)
+        services.ensure_audit_baseline(conn, win)
+        before_evaluation = services.compute_evaluation(conn, win)
         effect, reading = services.submit_reading(conn, window_id, payload)
         evaluation = services.compute_evaluation(conn, win)
+        if effect != "idempotent":
+            operation_type = (
+                OP_READING_RESTORE if effect == "restored" else OP_READING_SUBMIT
+            )
+            services.append_audit_entry(
+                conn,
+                window_id=window_id,
+                operation_type=operation_type,
+                before_evaluation=before_evaluation,
+                after_evaluation=evaluation,
+                rule_revision=win["rule_revision"],
+                reading_id=payload.reading_id,
+                reading_revision=reading["revision"],
+                operation={
+                    "effect": effect,
+                    "reading_id": reading["reading_id"],
+                    "revision": reading["revision"],
+                    "measured_at": reading["measured_at"],
+                    "temperature": reading["temperature"],
+                },
+            )
         return {"effect": effect, "reading": reading, "current_evaluation": evaluation}
 
 
@@ -239,8 +330,33 @@ def submit_reading_batch(
     # 单个写事务：整批校验 + 整批落库 + 基于最终状态一次重算
     with write_transaction(conn):
         win = services.get_window_row(conn, window_id)
+        services.ensure_audit_baseline(conn, win)
+        before_evaluation = services.compute_evaluation(conn, win)
         results = services.submit_reading_batch(conn, window_id, payload)
         evaluation = services.compute_evaluation(conn, win)
+        effects = [effect for effect, _ in results]
+        # 批量只记一条履历：至少一项实际生效才追加；整批幂等重放不追加。
+        if any(effect != "idempotent" for effect in effects):
+            affected = [
+                {"reading_id": reading["reading_id"], "revision": reading["revision"],
+                 "measured_at": reading["measured_at"], "temperature": reading["temperature"],
+                 "effect": effect}
+                for effect, reading in results
+            ]
+            services.append_audit_entry(
+                conn,
+                window_id=window_id,
+                operation_type=OP_READINGS_BATCH,
+                before_evaluation=before_evaluation,
+                after_evaluation=evaluation,
+                rule_revision=win["rule_revision"],
+                operation={
+                    "effects": effects,
+                    "item_count": len(results),
+                    "affected_count": sum(1 for e in effects if e != "idempotent"),
+                    "items": affected,
+                },
+            )
         return {
             "results": [{"effect": effect, "reading": reading}
                         for effect, reading in results],
@@ -272,8 +388,30 @@ def void_reading(
     # 单个写事务：校验 + 作废落库 + 基于同一状态立即重算
     with write_transaction(conn):
         win = services.get_window_row(conn, window_id)
+        services.ensure_audit_baseline(conn, win)
+        before_evaluation = services.compute_evaluation(conn, win)
         effect, record = services.void_reading(conn, window_id, reading_id, payload)
         evaluation = services.compute_evaluation(conn, win)
+        # 作废生效才追加履历；相同作废修订号+相同原因的幂等重放不追加。
+        if effect == "voided":
+            services.append_audit_entry(
+                conn,
+                window_id=window_id,
+                operation_type=OP_READING_VOID,
+                before_evaluation=before_evaluation,
+                after_evaluation=evaluation,
+                rule_revision=win["rule_revision"],
+                reading_id=record["reading_id"],
+                reading_revision=record["revision"],
+                operation={
+                    "effect": "voided",
+                    "reading_id": record["reading_id"],
+                    "revision": record["revision"],
+                    "reason": record["reason"],
+                    "voided_at": record["voided_at"],
+                    "previous": record["previous"],
+                },
+            )
         return {"effect": effect, "void": record, "current_evaluation": evaluation}
 
 

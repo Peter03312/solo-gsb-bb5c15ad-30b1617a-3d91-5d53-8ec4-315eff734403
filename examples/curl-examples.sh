@@ -243,3 +243,24 @@ d=json.load(sys.stdin)
 print('rules:',json.dumps(d['rules'],ensure_ascii=False))
 print('verdict:',d['summary']['verdict_before'],'->',d['summary']['verdict_after'])
 print('conclusion:',d['summary']['conclusion_zh'])"
+
+echo "== 16. 审定履历（审计日志）：从序号 0 基线起按时间顺序追溯 =="
+echo "-- 16.1 全量读取（seq=0 为建窗基线；幂等重放/签发/失败不占号，批量只占一条）--"
+api GET "/api/v1/windows/$WID/audit-entries" \
+  | python3 -c "
+import sys,json
+for e in json.load(sys.stdin):
+    print(e['seq'], e['operation_type'],
+          (e['verdict_before'] or '-'), '->', e['verdict_after'],
+          'max', e['max_continuous_exceeded_seconds_before'], '->',
+          e['max_continuous_exceeded_seconds_after'],
+          '变化区段数', len(e['changed_segments']))"
+
+echo "-- 16.2 从指定序号续读 + 分页（from_seq 含；超出末尾返回 []）--"
+api GET "/api/v1/windows/$WID/audit-entries?from_seq=2&limit=3" \
+  | python3 -c "import sys,json;print('本页序号:',[e['seq'] for e in json.load(sys.stdin)])"
+
+echo "-- 16.3 拒绝约定：窗口不存在 404；from_seq 为负 / limit 越界 422 --"
+api GET "/api/v1/windows/99999/audit-entries" || true
+api GET "/api/v1/windows/$WID/audit-entries?from_seq=-1" || true
+api GET "/api/v1/windows/$WID/audit-entries?limit=0" || true

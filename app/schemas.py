@@ -307,6 +307,47 @@ class CertificateOut(BaseModel):
     snapshot: dict[str, Any]
 
 
+# ------------------------------------------------------------ 审定履历（审计日志）
+
+class AuditSegmentChangeOut(BaseModel):
+    """一条履历中前后状态不同的半开区段 [start, end)。"""
+
+    start: str = Field(..., description="区段起点（含，UTC）")
+    end: str = Field(..., description="区段终点（不含，UTC）")
+    duration_seconds: float
+    status_before: str = Field(..., description="操作前状态 normal | exceeded | unknown")
+    status_after: str = Field(..., description="操作后状态 normal | exceeded | unknown")
+
+
+class AuditEntryOut(BaseModel):
+    """一条审定履历：窗口内连续编号（0 为审定基线），按序号升序读取。"""
+
+    seq: int = Field(..., description="窗口内连续序号：0 为审定基线，其后每次实际生效操作 +1")
+    operation_type: str = Field(
+        ..., description="baseline | reading_submit | reading_restore | readings_batch "
+                         "| reading_void | rule_revision")
+    operation_type_zh: str = Field(..., description="操作类型中文名")
+    reading_id: Optional[str] = Field(
+        None, description="涉及的读数 ID（批量提交在 operation 详情中逐项给出）")
+    reading_revision: Optional[int] = Field(None, description="涉及的读数修订号")
+    rule_revision: int = Field(..., description="记录时的当前规则版本（初始规则为第 1 版）")
+    rule_revision_ref: Optional[int] = Field(None, description="规则修订目标版本（仅规则修订）")
+    verdict_before: Optional[str] = Field(None, description="操作前结论（基线为 null）")
+    verdict_after: str = Field(..., description="操作后结论")
+    verdict_before_label_zh: Optional[str] = Field(None, description="操作前结论中文名（基线为 null）")
+    verdict_after_label_zh: str = Field(..., description="操作后结论中文名")
+    max_continuous_exceeded_seconds_before: Optional[float] = Field(
+        None, description="操作前最长连续超限时长（基线为 null）")
+    max_continuous_exceeded_seconds_after: float = Field(
+        ..., description="操作后最长连续超限时长")
+    changed_segments: list[AuditSegmentChangeOut] = Field(
+        ..., description="前后状态不同的半开区段（结论不变但时间线有变也列出；无变化为 []）")
+    operation: dict[str, Any] = Field(
+        ..., description="操作详情：读数 ID/修订号、批量逐项 effect、作废原因、规则版本等")
+    source: str = Field(..., description="基线来源 created | backfilled；非基线固定 created")
+    created_at: str = Field(..., description="记录时间（UTC）")
+
+
 # ------------------------------------------------------------ 修订影响报告
 
 class ReportReading(BaseModel):

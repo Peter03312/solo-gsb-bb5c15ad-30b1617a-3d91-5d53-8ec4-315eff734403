@@ -1,4 +1,4 @@
-"""业务服务层：窗口、读数（含误采作废/恢复）、审定、签发。"""
+"""业务服务层：窗口、读数（含误采作废/恢复）、审定、签发、审定履历。"""
 from __future__ import annotations
 
 import json
@@ -7,6 +7,16 @@ from typing import Any, Optional
 
 from fastapi import HTTPException, status
 
+from .audit import (
+    OP_BASELINE,
+    OP_READING_RESTORE,
+    OP_READING_SUBMIT,
+    OP_READING_VOID,
+    OP_READINGS_BATCH,
+    OP_RULE_REVISION,
+    OP_TYPES_ZH,
+    changed_segments,
+)
 from .evaluation import evaluate
 from .models import READING_VOIDED, VERDICT_LABELS_ZH
 from .report import build_revision_report
@@ -56,6 +66,8 @@ def create_window(conn: sqlite3.Connection, payload: WindowCreate) -> dict[str, 
     row = conn.execute("SELECT * FROM windows WHERE id = ?", (cur.lastrowid,)).fetchone()
     # 初始规则视为第 1 版，随建窗一并留存
     _ensure_initial_rule_revision(conn, row)
+    # 窗口创建即在同一写事务内保存序号 0 的审定基线（建窗时无活动读数）
+    insert_audit_baseline(conn, row, source="created")
     return window_to_dict(conn, row)
 
 
@@ -1005,3 +1017,200 @@ def revision_report(conn: sqlite3.Connection,
     old_cert = certificate_to_dict(old_row)
     new_cert = certificate_to_dict(new_row)
     return build_revision_report(old_cert, new_cert)
+
+
+# ---------------------------------------------------------------- 审定履历（审计日志）
+
+def _next_audit_seq(conn: sqlite3.Connection, window_id: int) -> int:
+    """该窗口下一条履历的连续序号（最大 seq +1；无行时为 0）。
+
+    所有写事务经 BEGIN IMMEDIATE 串行化，序号按实际提交顺序连续分配，
+    不会因回滚（失败请求）而产生空洞。
+    """
+    row = conn.execute(
+        "SELECT COALESCE(MAX(seq), -1) AS s FROM window_audit_entries WHERE window_id=?",
+        (window_id,),
+    ).fetchone()
+    return int(row["s"]) + 1
+
+
+def _max_continuous_of(evaluation: dict[str, Any]) -> float:
+    return float(evaluation["max_continuous_exceeded_seconds"])
+
+
+def insert_audit_baseline(
+    conn: sqlite3.Connection,
+    win: sqlite3.Row,
+    *,
+    source: str = "created",
+    evaluation: Optional[dict[str, Any]] = None,
+    created_at: Optional[str] = None,
+) -> sqlite3.Row:
+    """保存序号 0 的审定基线，返回插入行。调用方需已持有写事务。
+
+    - 建窗路径（source='created'）：以建窗时的规则、空活动读数计算，
+      记录时间沿用窗口创建时间；
+    - 既有窗口补建（source='backfilled'）：以当前规则和当前活动读数
+      （当时的实时状态）补建，不伪造更早的操作时间。
+    """
+    if evaluation is None:
+        evaluation = compute_evaluation(conn, win)
+    if created_at is None:
+        # 建窗基线沿用窗口创建时间；补建基线取当前时间（不伪造更早操作）
+        if source == "created":
+            created_at = win["created_at"]
+        else:
+            created_at = conn.execute(
+                "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now') AS t"
+            ).fetchone()["t"]
+    conn.execute(
+        """
+        INSERT INTO window_audit_entries (
+            window_id, seq, operation_type, reading_id, reading_revision,
+            rule_revision, rule_revision_ref, verdict_before, verdict_after,
+            max_exceeded_before, max_exceeded_after, changed_segments_json,
+            operation_json, source, created_at)
+        VALUES (?, 0, 'baseline', NULL, NULL, ?, NULL, NULL, ?, NULL, ?, '[]',
+                ?, ?, ?)
+        """,
+        (
+            win["id"], int(win["rule_revision"]), evaluation["verdict"],
+            _max_continuous_of(evaluation),
+            json.dumps(
+                {"source": source,
+                 "rule_revision": int(win["rule_revision"]),
+                 "note": (
+                     "窗口创建时保存的审定基线"
+                     if source == "created"
+                     else "既有窗口升级时以当时规则与活动读数补建的审定基线")},
+                ensure_ascii=False),
+            source, created_at,
+        ),
+    )
+    return conn.execute(
+        "SELECT * FROM window_audit_entries WHERE window_id=? AND seq=0",
+        (win["id"],),
+    ).fetchone()
+
+
+def ensure_audit_baseline(conn: sqlite3.Connection, win: sqlite3.Row) -> None:
+    """确保窗口有序号 0 的基线（防御性兜底）。
+
+    正常路径下建窗已写基线；仅当历史库窗口因异常缺失基线时，按“既有窗口
+    补建”语义以当前规则和活动读数补建（不伪造更早操作）。基线已存在则不动。
+    """
+    exists = conn.execute(
+        "SELECT 1 FROM window_audit_entries WHERE window_id=? AND seq=0",
+        (win["id"],),
+    ).fetchone()
+    if exists is None:
+        insert_audit_baseline(conn, win, source="backfilled")
+
+
+def backfill_audit_baselines(conn: sqlite3.Connection) -> int:
+    """为全部缺少序号 0 基线的既有窗口补建基线（启动迁移调用，幂等）。
+
+    以补建时刻的当前规则与当前活动读数计算，不伪造更早操作；记录时间取
+    当前时间。返回补建窗口数。
+    """
+    window_ids = [
+        int(r["id"])
+        for r in conn.execute("SELECT id FROM windows ORDER BY id ASC").fetchall()
+    ]
+    count = 0
+    for window_id in window_ids:
+        exists = conn.execute(
+            "SELECT 1 FROM window_audit_entries WHERE window_id=? AND seq=0",
+            (window_id,),
+        ).fetchone()
+        if exists is not None:
+            continue
+        win = get_window_row(conn, window_id)
+        insert_audit_baseline(conn, win, source="backfilled")
+        count += 1
+    return count
+
+
+def append_audit_entry(
+    conn: sqlite3.Connection,
+    *,
+    window_id: int,
+    operation_type: str,
+    before_evaluation: dict[str, Any],
+    after_evaluation: dict[str, Any],
+    rule_revision: int,
+    operation: dict[str, Any],
+    reading_id: Optional[str] = None,
+    reading_revision: Optional[int] = None,
+    rule_revision_ref: Optional[int] = None,
+) -> sqlite3.Row:
+    """在当前写事务内追加一条连续编号履历，返回插入行。
+
+    仅由“实际生效”的操作调用：记录操作类型、涉及读数 ID/规则版本、操作前后
+    结论与最长连续超限时长，以及前后状态不同的半开区段。即使结论不变，
+    只要操作生效就记录；幂等重放、签发证书与失败请求不得调用本函数。
+    """
+    seq = _next_audit_seq(conn, window_id)
+    segments = changed_segments(before_evaluation, after_evaluation)
+    conn.execute(
+        """
+        INSERT INTO window_audit_entries (
+            window_id, seq, operation_type, reading_id, reading_revision,
+            rule_revision, rule_revision_ref, verdict_before, verdict_after,
+            max_exceeded_before, max_exceeded_after, changed_segments_json,
+            operation_json, source)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'created')
+        """,
+        (
+            window_id, seq, operation_type, reading_id, reading_revision,
+            int(rule_revision), rule_revision_ref,
+            before_evaluation["verdict"], after_evaluation["verdict"],
+            _max_continuous_of(before_evaluation),
+            _max_continuous_of(after_evaluation),
+            json.dumps(segments, ensure_ascii=False),
+            json.dumps(operation, ensure_ascii=False),
+        ),
+    )
+    return conn.execute(
+        "SELECT * FROM window_audit_entries WHERE window_id=? AND seq=?",
+        (window_id, seq),
+    ).fetchone()
+
+
+def list_audit_entries(
+    conn: sqlite3.Connection, window_id: int, from_seq: int = 0, limit: int = 100
+) -> list[dict[str, Any]]:
+    """按窗口和起始序号顺序读取履历（seq 升序）。窗口不存在由调用方先判 404。"""
+    rows = conn.execute(
+        "SELECT * FROM window_audit_entries WHERE window_id=? AND seq>=? "
+        "ORDER BY seq ASC LIMIT ?",
+        (window_id, from_seq, limit),
+    ).fetchall()
+    return [audit_entry_to_dict(r) for r in rows]
+
+
+def audit_entry_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    """履历行 -> API 输出（含中文操作类型/结论标签与解析后的区段、详情）。"""
+    after_verdict = row["verdict_after"]
+    before_verdict = row["verdict_before"]
+    return {
+        "seq": int(row["seq"]),
+        "operation_type": row["operation_type"],
+        "operation_type_zh": OP_TYPES_ZH.get(row["operation_type"], row["operation_type"]),
+        "reading_id": row["reading_id"],
+        "reading_revision": row["reading_revision"],
+        "rule_revision": int(row["rule_revision"]),
+        "rule_revision_ref": row["rule_revision_ref"],
+        "verdict_before": before_verdict,
+        "verdict_after": after_verdict,
+        "verdict_before_label_zh": (
+            VERDICT_LABELS_ZH.get(before_verdict, before_verdict)
+            if before_verdict is not None else None),
+        "verdict_after_label_zh": VERDICT_LABELS_ZH.get(after_verdict, after_verdict),
+        "max_continuous_exceeded_seconds_before": row["max_exceeded_before"],
+        "max_continuous_exceeded_seconds_after": row["max_exceeded_after"],
+        "changed_segments": json.loads(row["changed_segments_json"]),
+        "operation": json.loads(row["operation_json"]),
+        "source": row["source"],
+        "created_at": row["created_at"],
+    }
